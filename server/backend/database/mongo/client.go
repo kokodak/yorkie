@@ -1023,6 +1023,48 @@ func (c *Client) FindChangesBetweenServerSeqs(
 	return changes, nil
 }
 
+// FindChangesBetweenServerSeqsBulk returns the changes between two server sequences.
+func (c *Client) FindChangesBetweenServerSeqsBulk(
+	ctx context.Context,
+	docRefKeys []types.DocRefKey,
+	fromSeqs []int64,
+	toSeqs []int64,
+) (map[types.DocRefKey][]*change.Change, error) {
+	var orConditions []bson.M
+	for i, docRefKey := range docRefKeys {
+		orConditions = append(orConditions, bson.M{
+			"project_id": docRefKey.ProjectID,
+			"doc_id":     docRefKey.DocID,
+			"server_seq": bson.M{
+				"$gte": fromSeqs[i],
+				"$lte": toSeqs[i],
+			},
+		})
+	}
+
+	cursor, err := c.collection(ColChanges).Find(ctx, bson.M{"$or": orConditions}, options.Find())
+	if err != nil {
+		return nil, fmt.Errorf("find changes: %w", err)
+	}
+
+	var infos []*database.ChangeInfo
+	if err := cursor.All(ctx, &infos); err != nil {
+		return nil, fmt.Errorf("fetch changes: %w", err)
+	}
+
+	result := make(map[types.DocRefKey][]*change.Change)
+	for _, info := range infos {
+		mapKey := types.DocRefKey{ProjectID: info.ProjectID, DocID: info.DocID}
+		c, err := info.ToChange()
+		if err != nil {
+			return nil, err
+		}
+		result[mapKey] = append(result[mapKey], c)
+	}
+
+	return result, nil
+}
+
 // FindChangeInfosBetweenServerSeqs returns the changeInfos between two server sequences.
 func (c *Client) FindChangeInfosBetweenServerSeqs(
 	ctx context.Context,
@@ -1137,6 +1179,73 @@ func (c *Client) FindClosestSnapshotInfo(
 	}
 
 	return snapshotInfo, nil
+}
+
+// FindClosestSnapshotInfoBulk finds the closest snapshot infos in a given serverSeq.
+func (c *Client) FindClosestSnapshotInfoBulk(
+	ctx context.Context,
+	docRefKeys []types.DocRefKey,
+	serverSeqs []int64,
+	includeSnapshot bool,
+) ([]*database.SnapshotInfo, error) {
+	// 01. Compose OR conditions
+	orConditions := make([]bson.M, len(docRefKeys))
+	for i, docRefKey := range docRefKeys {
+		orConditions[i] = bson.M{
+			"project_id": docRefKey.ProjectID,
+			"doc_id":     docRefKey.DocID,
+			"server_seq": bson.M{"$lte": serverSeqs[i]},
+		}
+	}
+
+	// 02. Aggregate pipeline
+	pipeline := []bson.M{
+		{"$match": bson.M{"$or": orConditions}},
+		{"$sort": bson.M{"doc_id": 1, "project_id": 1, "server_seq": -1}},
+		{"$group": bson.M{
+			"_id":           bson.M{"doc_id": "$doc_id", "project_id": "$project_id"},
+			"snapshot_info": bson.M{"$first": "$$ROOT"},
+		}},
+		{"$replaceRoot": bson.M{"newRoot": "$snapshot_info"}},
+	}
+
+	// 03. Projection setting (if necessary)
+	if !includeSnapshot {
+		pipeline = append(pipeline, bson.M{
+			"$project": bson.M{"Snapshot": 0},
+		})
+	}
+
+	// 04. Execute the query and decode the results
+	cursor, err := c.collection(ColSnapshots).Aggregate(ctx, pipeline)
+	if err != nil {
+		return nil, fmt.Errorf("aggregate snapshots: %w", err)
+	}
+
+	var snapshotInfos []*database.SnapshotInfo
+	if err := cursor.All(ctx, &snapshotInfos); err != nil {
+		return nil, fmt.Errorf("decode snapshots: %w", err)
+	}
+
+	// 05. Make the result in the same order as the input
+	result := make([]*database.SnapshotInfo, len(docRefKeys))
+	foundMap := make(map[string]*database.SnapshotInfo)
+
+	for _, info := range snapshotInfos {
+		mapKey := fmt.Sprintf("%s:%s", info.ProjectID, info.DocID)
+		foundMap[mapKey] = info
+	}
+
+	for i, docRefKey := range docRefKeys {
+		mapKey := fmt.Sprintf("%s:%s", docRefKey.ProjectID, docRefKey.DocID)
+		if info, ok := foundMap[mapKey]; ok {
+			result[i] = info
+		} else {
+			result[i] = &database.SnapshotInfo{}
+		}
+	}
+
+	return result, nil
 }
 
 // FindMinSyncedSeqInfo finds the minimum synced sequence info.
